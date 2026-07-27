@@ -46,14 +46,14 @@ class DataProcessor:
         contact_frame=middle_data['right_wrist_y'].idxmax()
 
         # Isolate only backswing data
-        back_data=self.data[(self.data.index<contact_frame.item())]
+        back_data=self.data[(self.data.index<int(contact_frame))]
         # Find moment of top of backswing as the highest wrist point on y
         top_backswing_frame=back_data['right_wrist_y'].idxmin()
         # Find moment before start of the swing as the lowest wrist point on y before going halfway back
         halfway_back_data=self.data[self.data.index<halfway_back_ind]
         address_frame=halfway_back_data['right_wrist_y'].idxmax()
 
-        self.data=self.data.iloc[[max([address_frame.item()-4,0]), top_backswing_frame.item(), contact_frame.item()]]
+        self.data=self.data.iloc[[max([int(address_frame)-4,0]), int(top_backswing_frame), int(contact_frame)]]
 
         self.data['index']=self.data.index
         self.data=self.data.reset_index(drop=True)
@@ -133,9 +133,139 @@ class Evaluator:
     @staticmethod
     def calculate_head_distance(head_point_current, head_point_address):
         return np.linalg.norm(np.array(head_point_current).flatten()- np.array(head_point_address).flatten()) # Calculates distance of the head from the address point.
-        
 
 
+
+class SwingScorer:
+    """
+    Golf-style swing score: LOWER is BETTER (0 == physically perfect swing).
+
+    For every key joint angle the ideal is a perfectly STRAIGHT line = 180 deg
+    (straight lead arm, straight lead leg, straight ankle-hip-shoulder turn line).
+    The score is the DISTANCE FROM THAT IDEAL, measured continuously and always on:
+    a swing 4 deg from straight scores 4, one 20 deg from straight scores 20. This
+    rewards precision everywhere, so swings never cluster at 0 the way a pass/fail
+    band does - which is what a ranked leaderboard needs.
+
+    (The pass/fail bands still live in `Evaluator` and drive the red/green overlay;
+    the score no longer uses them.)
+
+    Units
+    -----
+    * Angle checks       -> penalty is DEGREES away from the ideal `target` (180).
+    * Head steadiness     -> ideal is zero drift; penalty is head travel from its
+      address spot, divided by the golfer's body height (scale-invariant, so
+      distance-to-camera and player height do not skew it) and put on the same
+      ~degree scale via POS_GAIN.
+    * Directional checks (hands/shoulder) -> these are 'must not cross' constraints,
+      not precision targets, so they only score when on the wrong side of the line.
+
+    Each check's penalty is capped (CAP) so one blown MediaPipe detection cannot
+    produce an absurd leaderboard number. The total is the sum of all checks.
+
+    Extensibility: to score against a real professional instead of golf theory,
+    set a check's `target` to the pro's measured angle - nothing else changes.
+    """
+
+    POS_GAIN = 100.0   # a positional error of one full body-height == 100 strokes
+    CAP = 25.0         # max strokes any single check may contribute
+    HEAD_TOL = 0.0     # ideal head drift is zero; any movement from address is scored
+
+    # Declarative check table.
+    #   kind='angle'  -> penalise |target - col|  (target = 180 = perfectly straight)
+    #   kind='pos_ge' -> `a_col` should be >= `b_col`; only penalise how far it falls short
+    #   kind='head'   -> penalise nose drift from its address spot (ideal = 0)
+    CHECKS = [
+        dict(phase='address', name='correct_arm_angle',      kind='angle',  col='arm_angle',    target=180,
+             label='Lead arm straight at address'),
+        dict(phase='address', name='correct_midpoint',       kind='pos_ge', a_col='left_wrist_x', b_col='midpoint_x',
+             label='Hands ahead of stance centre at address'),
+        dict(phase='top',     name='correct_pelvis',         kind='angle',  col='pelvis_angle', target=180,
+             label='Full turn: ankle-hip-shoulder in line at top'),
+        dict(phase='top',     name='correct_head',           kind='head',
+             label='Head steady at top of backswing'),
+        dict(phase='contact', name='correct_knee_angle',     kind='angle',  col='knee_angle',   target=180,
+             label='Lead leg straight at contact'),
+        dict(phase='contact', name='correct_arm_angle',      kind='angle',  col='arm_angle',    target=180,
+             label='Lead arm straight at contact'),
+        dict(phase='contact', name='correct_shoulder_ankle', kind='pos_ge', a_col='left_ankle_x', b_col='left_shoulder_x',
+             label='Lead shoulder not past front foot at contact'),
+        dict(phase='contact', name='correct_head',           kind='head',
+             label='Head steady at contact'),
+    ]
+
+    def __init__(self, data_processor):
+        self.data = data_processor.data
+        self.phase_index = {'address': 0, 'top': 1, 'contact': 2}
+        # Body height (px) at address used to make positional penalties scale-invariant.
+        addr = self.phase_index['address']
+        self.body_scale = abs(self.data['left_ankle_y'].iloc[addr] - self.data['nose_y'].iloc[addr])
+        if self.body_scale < 1:               # degenerate detection -> avoid divide-by-zero
+            self.body_scale = 1.0
+        # Address nose position, ordered [y, x] to match Evaluator.calculate_head_distance.
+        self.head_address = np.array([self.data['nose_y'].iloc[addr], self.data['nose_x'].iloc[addr]])
+
+    def _angle_penalty(self, col, idx, target):
+        value = float(self.data[col].iloc[idx])
+        return value, min(self.CAP, abs(target - value))         # degrees away from ideal (straight = 180)
+
+    def _pos_ge_penalty(self, a_col, b_col, idx):
+        a = float(self.data[a_col].iloc[idx])
+        b = float(self.data[b_col].iloc[idx])
+        shortfall_px = max(0.0, b - a)                            # a should be >= b
+        penalty = shortfall_px / self.body_scale * self.POS_GAIN
+        return (a - b), min(self.CAP, penalty)
+
+    def _head_penalty(self, idx):
+        nose = np.array([self.data['nose_y'].iloc[idx], self.data['nose_x'].iloc[idx]])
+        dist_px = float(np.linalg.norm(nose - self.head_address))
+        tol_px = self.HEAD_TOL * self.body_scale
+        penalty = max(0.0, dist_px - tol_px) / self.body_scale * self.POS_GAIN
+        return dist_px, min(self.CAP, penalty)
+
+    def score(self):
+        """
+        Returns a dict:
+          total       -> single golf-style score (float, lower is better, 0 == ideal)
+          phase       -> {'address':.., 'top':.., 'contact':..} penalty subtotals
+          checks      -> per-check breakdown [{phase,name,label,actual,penalty,passed}, ...]
+        """
+        checks, phase_totals = [], {'address': 0.0, 'top': 0.0, 'contact': 0.0}
+        for c in self.CHECKS:
+            idx = self.phase_index[c['phase']]
+            if c['kind'] == 'angle':
+                actual, penalty = self._angle_penalty(c['col'], idx, c['target'])
+            elif c['kind'] == 'pos_ge':
+                actual, penalty = self._pos_ge_penalty(c['a_col'], c['b_col'], idx)
+            else:  # head
+                actual, penalty = self._head_penalty(idx)
+            penalty = round(penalty, 2)
+            phase_totals[c['phase']] += penalty
+            checks.append({'phase': c['phase'], 'name': c['name'], 'label': c['label'],
+                           'actual': round(actual, 1), 'penalty': penalty, 'passed': penalty == 0.0})
+        total = round(sum(phase_totals.values()), 1)
+        phase_totals = {k: round(v, 1) for k, v in phase_totals.items()}
+        return {'total': total, 'phase': phase_totals, 'checks': checks}
+
+    @staticmethod
+    def _severity(penalty):
+        """Coarse tier for the scorecard (the score itself is continuous)."""
+        if penalty == 0:  return 'ideal'
+        if penalty < 5:   return 'good '
+        if penalty < 12:  return 'off  '
+        return 'BIG  '
+
+    def scorecard_text(self, player_name='Player'):
+        """Booth-friendly scorecard string."""
+        r = self.score()
+        lines = [f"==== GOLF SWING SCORE : {player_name} ====",
+                 f"  FINAL SCORE: {r['total']:.1f}  (lower is better, 0 = perfectly straight/still)",
+                 f"  By phase -> address {r['phase']['address']:.1f} | "
+                 f"top {r['phase']['top']:.1f} | contact {r['phase']['contact']:.1f}",
+                 "  ------------------------------------------------------------"]
+        for c in r['checks']:
+            lines.append(f"  [{self._severity(c['penalty'])}] {c['phase']:<7} {c['label']:<48} +{c['penalty']:.1f}")
+        return "\n".join(lines)
 
 
 class VideoProcessor:
