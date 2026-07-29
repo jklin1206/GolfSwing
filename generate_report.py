@@ -13,13 +13,13 @@ from process_swing import DataProcessor, SwingScorer
 from report_content import build_report_context, render_template_report, polish_report
 
 
-def report_for_folder(folder, player="Player", rank=None, total=None, polish=False):
+def report_for_folder(folder, player="Player", polish=False):
     dp = DataProcessor(folder)
     dp.load_data()
     dp.preprocess_data()
     scorer = SwingScorer(dp)
 
-    ctx = build_report_context(scorer, player=player, rank=rank, total=total)
+    ctx = build_report_context(scorer, player=player)
     draft = render_template_report(ctx)
     if polish:
         text, used_llm = polish_report(ctx, draft)
@@ -32,9 +32,7 @@ if __name__ == "__main__":
     folder = args[0] if args else "test_classes"
     polish = "--polish" in sys.argv
 
-    text, used_llm, ctx = report_for_folder(
-        folder, player="Priya", rank=7, total=42, polish=polish
-    )
+    text, used_llm, ctx = report_for_folder(folder, player="Priya", polish=polish)
     banner = "LLM-POLISHED" if used_llm else ("TEMPLATE (polish requested but Claude "
                                               "unavailable - fell back)" if polish else "TEMPLATE")
     print(f"===== {banner} =====\n")
